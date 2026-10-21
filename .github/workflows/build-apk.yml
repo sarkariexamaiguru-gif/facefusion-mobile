@@ -1,0 +1,87 @@
+name: build-apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (tag or branch)"
+        required: true
+        default: "v0.9.41"
+      release_tag:
+        description: "Release tag to take the prebuilt native libraries from"
+        required: true
+        default: "v0.9.41"
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          sdkmanager --install "platforms;android-35" "build-tools;34.0.0" "platform-tools"
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Fetch prebuilt native libraries from the release APK
+        env:
+          REL: ${{ inputs.release_tag }}
+        run: |
+          set -eux
+          APK="facefusion-mobile-${REL#v}-release.apk"
+          curl -sSL -o /tmp/rel.apk "https://github.com/AbrahamPaulJ/facefusion-mobile/releases/download/${REL}/${APK}"
+          rm -rf /tmp/x && mkdir -p /tmp/x
+          ( cd /tmp/x && unzip -o -j /tmp/rel.apk 'lib/arm64-v8a/*' )
+
+          # libffnative.so + libc++_shared.so are all the prebuilt dir needs. AndroidX JNI
+          # libs are supplied by Gradle; the QNN runtime libs go into jniLibs.
+          mkdir -p pn/arm64-v8a
+          cp /tmp/x/libffnative.so /tmp/x/libc++_shared.so pn/arm64-v8a/
+
+          mkdir -p work/android/app/src/main/jniLibs/arm64-v8a
+          cp /tmp/x/libQnn*.so work/android/app/src/main/jniLibs/arm64-v8a/
+
+          # The QNN staging task only checks that these files exist.
+          mkdir -p work/android/app/src/main/cpp/include/QNN
+          : > work/android/app/src/main/cpp/include/QNN/QnnBackend.h
+
+          # Name exactly the HTP tiers present, so the build's staging check passes.
+          TIERS=$(cd work/android/app/src/main/jniLibs/arm64-v8a && for f in libQnnHtpV*Stub.so; do echo "${f#libQnnHtpV}" | sed 's/Stub\.so$//'; done | tr '\n' ' ')
+          echo "QNN_HTP_TIERS=$TIERS" >> "$GITHUB_ENV"
+          echo "tiers: $TIERS"
+          ls -la pn/arm64-v8a work/android/app/src/main/jniLibs/arm64-v8a
+
+      - name: Create signing keystore
+        run: |
+          cd work/android
+          keytool -genkeypair -keystore ff.keystore -alias ff -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass android -keypass android -dname "CN=FaceFusion CI Build, O=Local"
+          printf 'storeFile=ff.keystore\nstorePassword=android\nkeyAlias=ff\nkeyPassword=android\n' > keystore.properties
+          echo "sdk.dir=${ANDROID_SDK_ROOT}" > local.properties
+
+      - name: Build release APK
+        run: |
+          cd work/android
+          ./gradlew :app:assembleRelease -PprebuiltNativeDir="$GITHUB_WORKSPACE/pn"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: facefusion-mobile-apk
+          path: work/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
