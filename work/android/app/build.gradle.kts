@@ -487,7 +487,10 @@ android {
         // 114 = 0.9.40 as released: the same content as 112, numbered above 113 so it
         // installs over the one phone that had it.
         // 115 = models can download from hf-mirror.com (issue #18).
-        versionCode = 115
+        // 116 = the Content Gate Lab gains a SOURCE FACE. With one set, each queued target
+        // is run through the real swap and the SWAPPED output is scored by the gate, so the
+        // verdict is over what a swap would actually produce rather than the raw target.
+        versionCode = 116
         versionName = "0.9.41$variantTag"    // "-dev" == NO content gate
         setProperty("archivesBaseName", "facefusion-mobile-$versionName")
         manifestPlaceholders["appLabel"] = appLabel
