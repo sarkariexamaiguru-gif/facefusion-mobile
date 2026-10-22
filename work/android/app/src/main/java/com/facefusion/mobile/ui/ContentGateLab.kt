@@ -9,6 +9,7 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -39,6 +41,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.facefusion.mobile.ContentGate
@@ -100,6 +104,20 @@ private data class CalibrationFit(
 )
 
 /**
+ * The outcome of running a REAL swap in the lab and scoring its swapped output.
+ *
+ * [gate] is the production content-gate verdict over the SWAPPED result, not the raw
+ * target. [swappedPreview] carries the swapped still for on-screen inspection (null for
+ * video, which is written to a file and sampled instead). [faces] is how many faces the
+ * swap processed, or -1 when unknown.
+ */
+data class LabSwapResult(
+    val gate: ContentGate.Result,
+    val swappedPreview: Bitmap? = null,
+    val faces: Int = -1,
+)
+
+/**
  * Developer-only calibration and test-set workbench for the existing ContentGate scorer.
  *
  * This screen never changes production policy. Its sliders, fitted calibration and
@@ -111,6 +129,8 @@ fun ContentGateLabScreen(
     modifier: Modifier = Modifier,
     onInspectStill: suspend (Bitmap) -> ContentGate.Result,
     onInspectClip: suspend (File) -> ContentGate.Result,
+    onSwapThenInspectStill: suspend (Bitmap, Bitmap) -> LabSwapResult,
+    onSwapThenInspectClip: suspend (Bitmap, File) -> LabSwapResult,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -132,6 +152,13 @@ fun ContentGateLabScreen(
     var pendingExport by remember { mutableStateOf("") }
     var nextId by remember { mutableIntStateOf(1) }
     val history = remember { mutableStateListOf<GateSample>() }
+
+    // Source face for the real-swap path. When set, each target is swapped with this face
+    // and the SWAPPED output is scored; when null, targets are scored directly as before.
+    var sourceUri by remember { mutableStateOf<Uri?>(null) }
+    var sourceName by remember { mutableStateOf("") }
+    var sourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var lastSwapPreview by remember { mutableStateOf<Bitmap?>(null) }
 
     val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) {
@@ -157,6 +184,20 @@ fun ContentGateLabScreen(
                 }
             }
             status = "Added $added video(s) to the test queue. Videos are sampled using ContentGate.inspectClip."
+        }
+    }
+    val sourcePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            runCatching { context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            sourceUri = uri
+            sourceName = displayName(context, uri)
+            scope.launch {
+                val bmp = withContext(Dispatchers.IO) { runCatching { decodeBitmap(context, uri) }.getOrNull() }
+                sourceBitmap = bmp
+                status = if (bmp != null)
+                    "Source face loaded: $sourceName. Each target is now swapped with this face and the SWAPPED output is scored."
+                else "Could not decode that source image."
+            }
         }
     }
     val mediaSaver = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { outputUri ->
@@ -215,23 +256,39 @@ fun ContentGateLabScreen(
             status = "Lab inference is OFF. No media was scored; production checks remain unchanged."
         } else if (!running) {
             running = true
-            status = "Scoring ${item.name}…"
+            val src = sourceBitmap
+            val postSwap = src != null
+            val tag = if (postSwap) "[swap] " else ""
+            status = if (postSwap)
+                "Swapping ${sourceName.ifBlank { "the source face" }} onto ${item.name}, then scoring the swapped output…"
+            else "Scoring ${item.name}…"
             scope.launch {
                 val sampleId = nextId++
                 try {
-                    val result = if (item.isVideo) {
+                    val outcome = if (item.isVideo) {
                         val temp = withContext(Dispatchers.IO) { copyUriToCache(context, item.uri, item.name) }
-                        try { onInspectClip(temp) } finally { temp.delete() }
+                        try {
+                            if (postSwap) onSwapThenInspectClip(src!!, temp)
+                            else LabSwapResult(onInspectClip(temp))
+                        } finally { temp.delete() }
                     } else {
                         val bitmap = withContext(Dispatchers.IO) { decodeBitmap(context, item.uri) }
-                        onInspectStill(bitmap)
+                        if (postSwap) onSwapThenInspectStill(src!!, bitmap)
+                        else LabSwapResult(onInspectStill(bitmap))
                     }
+                    val result = outcome.gate
+                    lastSwapPreview = outcome.swappedPreview
                     val failed = result.verdict == ContentGate.Verdict.ERROR
                     val sample = GateSample(
                         id = sampleId,
-                        name = item.name,
+                        name = tag + item.name,
                         timestampMs = System.currentTimeMillis(),
-                        mediaType = if (item.isVideo) "video" else "image",
+                        mediaType = when {
+                            postSwap && item.isVideo -> "swapped-video"
+                            postSwap -> "swapped-image"
+                            item.isVideo -> "video"
+                            else -> "image"
+                        },
                         score = result.score,
                         expected = ExpectedLabel.UNLABELLED,
                         sampledFrames = result.sampled.coerceAtLeast(1),
@@ -247,16 +304,22 @@ fun ContentGateLabScreen(
                         val wouldFlag = isFlagged(p, probabilityThreshold.toDouble())
                         val labAction = if (responseStrength <= 0f) "OBSERVE ONLY" else
                             if (isFlagged(p, effectiveThreshold(probabilityThreshold.toDouble(), responseStrength.toDouble()))) "FLAGGED" else "PASS"
-                        status = "${item.name}: native=${sample.nativeVerdict} · raw=${formatScore(sample.score)} · " +
+                        status = (if (postSwap) "SWAPPED ${item.name}" else item.name) +
+                            ": native=${sample.nativeVerdict} · raw=${formatScore(sample.score)} · " +
                             "p=${formatProbability(p)} · would flag=${if (wouldFlag) "YES" else "NO"} · lab action=$labAction" +
                             if (item.isVideo) " · ${sample.sampledFrames} samples, ${sample.flaggedFrames} flagged" else ""
                     } else status = "ERROR for ${item.name}: ${sample.error}"
                 } catch (t: Throwable) {
                     val failedSample = GateSample(
                         id = sampleId,
-                        name = item.name,
+                        name = tag + item.name,
                         timestampMs = System.currentTimeMillis(),
-                        mediaType = if (item.isVideo) "video" else "image",
+                        mediaType = when {
+                            postSwap && item.isVideo -> "swapped-video"
+                            postSwap -> "swapped-image"
+                            item.isVideo -> "video"
+                            else -> "image"
+                        },
                         score = Float.NaN,
                         expected = ExpectedLabel.UNLABELLED,
                         nativeVerdict = "ERROR",
@@ -452,6 +515,48 @@ fun ContentGateLabScreen(
 
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Source face", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Pick the face to swap in. With a source set, each target below is run through the real swap and the " +
+                        "SWAPPED output is scored by the content gate — so the score is of what a swap would actually " +
+                        "produce, not of the raw target. Without a source, targets are scored as-is.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    val sb = sourceBitmap
+                    if (sb != null) {
+                        Image(bitmap = sb.asImageBitmap(), contentDescription = "Selected source face",
+                            modifier = Modifier.size(56.dp), contentScale = ContentScale.Crop)
+                    }
+                    Column(Modifier.weight(1f)) {
+                        Text(if (sb != null) "Source: ${sourceName.ifBlank { "selected image" }}" else "No source face selected",
+                            style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            if (sb != null) "Runs will swap this face, then score the swapped output."
+                            else "Targets will be scored directly, without a swap.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { sourcePicker.launch(arrayOf("image/*")) }, enabled = !running,
+                        modifier = Modifier.weight(1f)) {
+                        Text(if (sourceBitmap == null) "Choose source face" else "Change source face")
+                    }
+                    if (sourceBitmap != null || sourceUri != null) {
+                        OutlinedButton(onClick = {
+                            sourceUri = null; sourceBitmap = null; sourceName = ""; lastSwapPreview = null
+                            status = "Source face cleared. Targets are scored directly again."
+                        }, enabled = !running) { Text("Clear") }
+                    }
+                }
+            }
+        }
+
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("Add test images and videos", style = MaterialTheme.typography.titleMedium)
                 Text(
                     "Select one or several local media files. Images use inspectStill(); videos are copied to a temporary cache file and scored with inspectClip(), including the configured frame-sampling rule.",
@@ -510,6 +615,23 @@ fun ContentGateLabScreen(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+        }
+
+        val swapPreview = lastSwapPreview
+        if (swapPreview != null) {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Last swapped output", style = MaterialTheme.typography.titleMedium)
+                    Image(bitmap = swapPreview.asImageBitmap(), contentDescription = "Swapped output",
+                        modifier = Modifier.fillMaxWidth(), contentScale = ContentScale.Fit)
+                    Text(
+                        "The frame the content gate scored above — the result of swapping the source face onto the " +
+                            "most recent still target, before any gate decision.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         }
 
