@@ -8,6 +8,7 @@ import androidx.compose.material.icons.filled.Settings
 // icons-core only. The extended icon pack is a multi-megabyte dependency for
 // one glyph, and PlayArrow reads as a running feed well enough.
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -18,7 +19,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.facefusion.mobile.R
 
-enum class Screen { Swap, Live, Settings }
+enum class Screen { Swap, Live, ContentGateLab, Settings }
 
 /**
  * The frame around both screens: brand band above, two destinations below.
@@ -102,6 +103,12 @@ fun AppScaffold(
                     onClick = { onScreen(Screen.Live) },
                     icon = { Icon(Icons.Default.PlayArrow, stringResource(R.string.nav_live)) },
                     label = { Text(stringResource(R.string.nav_live)) },
+                )
+                NavigationBarItem(
+                    selected = screen == Screen.ContentGateLab,
+                    onClick = { onScreen(Screen.ContentGateLab) },
+                    icon = { Icon(Icons.Default.Search, "Content Gate Lab") },
+                    label = { Text("Lab") },
                 )
                 NavigationBarItem(
                     selected = screen == Screen.Settings,

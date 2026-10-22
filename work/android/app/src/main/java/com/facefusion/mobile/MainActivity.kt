@@ -1848,6 +1848,9 @@ class MainActivity : ComponentActivity() {
                         // reports the NPU busy, and the pipeline Live configured is still
                         // the loaded one.
                         if (screen == Screen.Live && it != Screen.Live) stopLive()
+                        if (screen == Screen.ContentGateLab && it != Screen.ContentGateLab) {
+                            previewOptionsChanged(hard = true)
+                        }
                         screen = it
                     },
                     // Shown on BOTH lines now. It was dev-only for one reason -- the live
@@ -2101,6 +2104,12 @@ class MainActivity : ComponentActivity() {
                                 selectionBox = liveSelectionBox,
                                 onClearAssignments = ::clearLiveAssignments,
                                 onToggleRecord = ::toggleLiveRecording,
+                            )
+
+                            Screen.ContentGateLab -> ContentGateLabScreen(
+                                modifier = Modifier,
+                                onInspectStill = ::inspectLabStill,
+                                onInspectClip = ::inspectLabClip,
                             )
 
                             Screen.Settings -> SettingsScreen(
@@ -2685,6 +2694,76 @@ class MainActivity : ComponentActivity() {
      * The inactive sets are read from DISK rather than from the chip or the manifest: what
      * matters about them is only that they are taking up space.
      */
+    /**
+     * The lab shares the same native pipeline singleton as previews, swaps and the API.
+     * Initialise and score under PipeGuard, then release and invalidate the preview cache.
+     * This makes diagnostics independent of whether the user had already opened Swap.
+     * The lab's experimental probability cutoff never changes the production policy.
+     */
+    private suspend fun inspectLabStill(bitmap: Bitmap): ContentGate.Result =
+        inspectInContentLab { ContentGate.inspectStill(bitmap) }
+
+    private suspend fun inspectLabClip(file: File): ContentGate.Result =
+        inspectInContentLab { ContentGate.inspectClip(file) }
+
+    private suspend fun inspectInContentLab(check: () -> ContentGate.Result): ContentGate.Result {
+        val models = modelDir()
+        val libDir = applicationInfo.nativeLibraryDir
+        val runOptions = opts.copy(
+            faceEdit = false,
+            faceAnimate = false,
+            faceEnhance = false,
+            lipSync = false,
+            swapEnabled = true,
+        )
+        var didAcquirePipeline = false
+        val result = withContext(Dispatchers.Default) {
+            if (!PipeGuard.acquire("content-lab", 750)) {
+                return@withContext ContentGate.Result(
+                    ContentGate.Verdict.ERROR, Float.NaN,
+                    detail = "Native pipeline is busy (${PipeGuard.busyMessage()}); retry when the current operation finishes.",
+                )
+            }
+            didAcquirePipeline = true
+            try {
+                val activeTier = ModelPaths.tier(this@MainActivity)
+                val missing = ModelPaths.missing(this@MainActivity, activeTier, runOptions.swapper)
+                if (missing.isNotEmpty()) {
+                    return@withContext ContentGate.Result(
+                        ContentGate.Verdict.ERROR, Float.NaN,
+                        detail = "Required models missing for tier $activeTier: ${missing.joinToString()}. Open Settings > Models and complete the model download first.",
+                    )
+                }
+                val ok = NativePipe.init(libDir, libDir, models.absolutePath, runOptions)
+                if (!ok) {
+                    return@withContext ContentGate.Result(
+                        ContentGate.Verdict.ERROR, Float.NaN,
+                        detail = "Native checker pipeline init failed: ${NativePipe.lastError()}",
+                    )
+                }
+                check()
+            } catch (t: Throwable) {
+                ContentGate.Result(
+                    ContentGate.Verdict.ERROR, Float.NaN,
+                    detail = t.message ?: t.javaClass.simpleName,
+                )
+            } finally {
+                runCatching { NativePipe.release() }
+                PipeGuard.release()
+            }
+        }
+        // Init/release replaced the process-global pipeline only if we acquired it. If a
+        // swap/API job kept the lock, leave its preview state alone and report a retryable
+        // diagnostic error rather than tearing down someone else's work.
+        if (didAcquirePipeline) {
+            previewWarm = false
+            previews.invalidate()
+            swappedFrame = null
+            preview = null
+        }
+        return result
+    }
+
     private fun modelSections(): List<ModelSection> {
         val active = tier
         val others = ModelPaths.variantsOnDisk(this).filter { it != active }
