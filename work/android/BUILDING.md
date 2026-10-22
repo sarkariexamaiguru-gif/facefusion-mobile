@@ -30,3 +30,8 @@ debug signing key. APKs are generated in `app/build/outputs/apk/debug/`.
 
 Device acceptance checks for the new recording option are in
 [tests/live-microphone.md](tests/live-microphone.md).
+
+## Content Gate Lab
+
+The integrated **Lab** tab and its raw-score/probability calibration controls are documented in [CONTENT_GATE_LAB.md](CONTENT_GATE_LAB.md). The tool reuses the installed native checker under `PipeGuard`; all threshold experiments and observe-only controls are diagnostic-only and do not modify production gate policy.
+
