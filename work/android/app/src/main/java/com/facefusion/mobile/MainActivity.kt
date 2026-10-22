@@ -2110,6 +2110,8 @@ class MainActivity : ComponentActivity() {
                                 modifier = Modifier,
                                 onInspectStill = ::inspectLabStill,
                                 onInspectClip = ::inspectLabClip,
+                                onSwapThenInspectStill = ::labSwapThenScoreStill,
+                                onSwapThenInspectClip = ::labSwapThenScoreClip,
                             )
 
                             Screen.Settings -> SettingsScreen(
@@ -2755,6 +2757,107 @@ class MainActivity : ComponentActivity() {
         // Init/release replaced the process-global pipeline only if we acquired it. If a
         // swap/API job kept the lock, leave its preview state alone and report a retryable
         // diagnostic error rather than tearing down someone else's work.
+        if (didAcquirePipeline) {
+            previewWarm = false
+            previews.invalidate()
+            swappedFrame = null
+            preview = null
+        }
+        return result
+    }
+
+    /**
+     * The lab's REAL-SWAP path. Runs the chosen source face through the actual swap onto the
+     * target, then scores the SWAPPED output with the production content gate — so the
+     * verdict is over what a swap would actually produce, not the raw target.
+     *
+     * Shares the native pipeline singleton with previews, swaps and the API, so it holds
+     * [PipeGuard] for the whole run and releases + invalidates the preview cache afterwards,
+     * exactly like [inspectInContentLab]. Nothing here changes production gate policy.
+     */
+    private suspend fun labSwapThenScoreStill(source: Bitmap, target: Bitmap): LabSwapResult {
+        val src = labBgrFrame(source) ?: return labSwapError("cannot read the source face image")
+        val tgt = labBgrFrame(target) ?: return labSwapError("cannot read the target image")
+        return withLabSwapPipeline {
+            if (!NativePipe.setSource(src.bgr, src.w, src.h))
+                return@withLabSwapPipeline labSwapError("source: ${NativePipe.lastError()}")
+            // processFrame swaps in place, so hand it a copy and keep the swapped frame.
+            val swapped = tgt.bgr.copyOf()
+            val faces = NativePipe.processFrame(swapped, tgt.w, tgt.h)
+            if (faces < 0)
+                return@withLabSwapPipeline labSwapError("swap failed: ${NativePipe.lastError()}")
+            val argb = NativePipe.bgrToArgb(swapped, tgt.w, tgt.h, tgt.w, tgt.h)
+            val bitmap = Bitmap.createBitmap(argb, tgt.w, tgt.h, Bitmap.Config.ARGB_8888)
+            LabSwapResult(ContentGate.inspectStill(bitmap), bitmap, faces)
+        }
+    }
+
+    private suspend fun labSwapThenScoreClip(source: Bitmap, target: File): LabSwapResult {
+        val src = labBgrFrame(source) ?: return labSwapError("cannot read the source face image")
+        return withLabSwapPipeline {
+            if (!NativePipe.setSource(src.bgr, src.w, src.h))
+                return@withLabSwapPipeline labSwapError("source: ${NativePipe.lastError()}")
+            val out = File(cacheDir, "lab-swapped-${System.currentTimeMillis()}.mp4")
+            try {
+                VideoSwapper().swap(target.absolutePath, out.absolutePath).getOrThrow()
+                LabSwapResult(ContentGate.inspectClip(out), null, -1)
+            } catch (t: Throwable) {
+                labSwapError(t.message ?: t.javaClass.simpleName)
+            } finally {
+                out.delete()
+            }
+        }
+    }
+
+    private class LabBgrFrame(val bgr: ByteArray, val w: Int, val h: Int)
+
+    private fun labBgrFrame(bitmap: Bitmap): LabBgrFrame? {
+        val soft = bitmap.asArgb8888() ?: return null
+        val px = IntArray(soft.width * soft.height)
+        soft.getPixels(px, 0, soft.width, 0, 0, soft.width, soft.height)
+        return LabBgrFrame(NativePipe.argbToBgr(px, soft.width, soft.height), soft.width, soft.height)
+    }
+
+    private fun labSwapError(detail: String) =
+        LabSwapResult(ContentGate.Result(ContentGate.Verdict.ERROR, Float.NaN, detail = detail))
+
+    /** Load the swap pipeline under [PipeGuard], run [block], then release + invalidate. */
+    private suspend fun withLabSwapPipeline(block: () -> LabSwapResult): LabSwapResult {
+        val models = modelDir()
+        val libDir = applicationInfo.nativeLibraryDir
+        val runOptions = opts.copy(
+            faceEdit = false,
+            faceAnimate = false,
+            faceEnhance = false,
+            lipSync = false,
+            swapEnabled = true,
+        )
+        var didAcquirePipeline = false
+        val result = withContext(Dispatchers.Default) {
+            if (!PipeGuard.acquire("content-lab-swap", 750)) {
+                return@withContext labSwapError(
+                    "Native pipeline is busy (${PipeGuard.busyMessage()}); retry when the current operation finishes.")
+            }
+            didAcquirePipeline = true
+            try {
+                val activeTier = ModelPaths.tier(this@MainActivity)
+                val missing = ModelPaths.missing(this@MainActivity, activeTier, runOptions.swapper)
+                if (missing.isNotEmpty()) {
+                    return@withContext labSwapError(
+                        "Required models missing for tier $activeTier: ${missing.joinToString()}. " +
+                            "Open Settings > Models and complete the model download first.")
+                }
+                if (!NativePipe.init(libDir, libDir, models.absolutePath, runOptions)) {
+                    return@withContext labSwapError("Native swap pipeline init failed: ${NativePipe.lastError()}")
+                }
+                block()
+            } catch (t: Throwable) {
+                labSwapError(t.message ?: t.javaClass.simpleName)
+            } finally {
+                runCatching { NativePipe.release() }
+                PipeGuard.release()
+            }
+        }
         if (didAcquirePipeline) {
             previewWarm = false
             previews.invalidate()
